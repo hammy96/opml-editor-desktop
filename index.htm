@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <title>D3 Tree — Aspect-limited Boxes</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; overflow: hidden; }
+    svg#tree { width: 100vw; height: 85vh; background: #f9f9f9; display: block; }
+    #controls { position: absolute; z-index: 20; left: 8px; top: 8px; background: rgba(255,255,255,0.95); padding: 8px; border-radius: 6px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
+    #controls textarea { font-size: 0.7em; width: 360px; height: 72px; display:block; margin-bottom:6px; }
+    #contextMenu { position: absolute; z-index: 30; display: none; background: #eee; border: 1px solid #888; }
+    #contextMenu div { padding: 8px 12px; cursor: pointer; white-space: nowrap; }
+    #contextMenu div:hover { background: #ccc; }
+    input, button { font-size: 14px; margin: 3px 4px 3px 0; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <textarea id="debug" readonly></textarea>
+    <input type="file" id="fileInput" accept=".opml">
+    <button id="saveButton">Save</button>
+    <button onclick="goFullScreen()">FS</button>
+    <button onclick="toggleDivElements('controls')">GUI</button>
+  </div>
+
+  <svg id="tree"></svg>
+
+  <div id="contextMenu">
+    <div id="addChild">Add child</div>
+    <div id="renameNode">Rename node</div>
+    <div id="deleteNode">Delete node</div>
+    <div id="showChildrenOnly">Show children only</div>
+    <div id="expandAllDescendants">Expand descendants</div>
+    <div id="collapseAllDescendants">Collapse descendants</div>
+    <div id="cutNode">Cut</div>
+    <div id="pasteNode">Paste</div>
+    <div id="saveBranch">Save branch</div>
+    <div id="importBranch">Import branch</div>
+  </div>
+
+  <input type="file" id="importBranchFile" accept=".opml" style="display: none;">
+
+<script>
+const debugArea = document.getElementById('debug');
+function dbg(...args) {
+  let text = args.map(a => (typeof a === 'object' ? JSON.stringify(a, null, 2) : a)).join(' ') + '\n';
+  if (!debugArea) { console.log(text); } else { debugArea.value += text; debugArea.scrollTop = debugArea.scrollHeight; }
+}
+dbg("App start");
+
+try {
+  const svg = d3.select("#tree"), g = svg.append("g");
+  let selectedNode = null, treeRoot = null, pasteBuffer = null, lastHierarchy = null;
+  const strokeWidth = 1;
+
+  // Horizontal pitch constant (repeating horizontal distance)
+  const HORIZONTAL_PITCH = 310; // change this to adjust horizontal spacing
+
+  // geometric zoom (pure transform)
+  svg.call(
+    d3.zoom()
+      .scaleExtent([0.02, 10])
+      .on("zoom", e => { g.attr("transform", e.transform); })
+  ).call(d3.zoom().transform, d3.zoomIdentity.scale(0.8));
+
+  // Hide context menu on outside click
+  window.addEventListener("click", evt => {
+    const cm = document.getElementById("contextMenu");
+    if (!cm.contains(evt.target)) cm.style.display = "none";
+  });
+
+  // --- File input (load OPML) ---
+  document.getElementById("fileInput").onchange = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const xml = new DOMParser().parseFromString(reader.result, "text/xml");
+      treeRoot = parseOPML(xml);
+      renderTree(treeRoot);
+      dbg("Loaded OPML");
+    };
+    reader.readAsText(file);
+  };
+
+  // --- Save whole tree ---
+  document.getElementById("saveButton").addEventListener("click", () => {
+    if (!treeRoot) { alert("No tree to save."); return; }
+    try {
+      const opmlString = generateOPML(treeRoot);
+      const blob = new Blob([opmlString], { type: "text/xml" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = getFormattedDateTime() + "--opml.opml";
+      document.body.appendChild(a); // required by some browsers
+      a.click();
+      a.remove();
+      dbg("Saved OPML");
+    } catch (err) {
+      console.error(err);
+      alert("Failed to save tree.");
+    }
+  });
+
+  // --- Context menu item hookups ---
+  document.getElementById("addChild").onclick = () => {
+    if (!selectedNode) return;
+    while (true) {
+      const name = prompt("New child (blank=end):", "");
+      if (!name) break;
+      selectedNode.children = selectedNode.children || [];
+      selectedNode.children.push({ name, children: [], collapsed: false });
+      selectedNode.collapsed = false;
+      renderTree(treeRoot);
+    }
+    hideContextMenu();
+  };
+
+  document.getElementById("renameNode").onclick = () => {
+    if (!selectedNode) return;
+    const newName = prompt("Enter new name:", selectedNode.name);
+    if (newName !== null && newName !== undefined) {
+      selectedNode.name = newName;
+      renderTree(treeRoot);
+    }
+    hideContextMenu();
+  };
+
+  document.getElementById("deleteNode").onclick = () => {
+    if (!selectedNode) { hideContextMenu(); return; }
+    if (selectedNode === treeRoot) { alert("Cannot delete the root node."); hideContextMenu(); return; }
+    removeNode(treeRoot, selectedNode);
+    renderTree(treeRoot);
+    hideContextMenu();
+  };
+
+  document.getElementById("showChildrenOnly").onclick = () => {
+    if (!selectedNode) { hideContextMenu(); return; }
+    // collapse everything, then un-collapse ancestors of selected, and keep selected expanded
+    function collapseAll(node) { node.collapsed = true; if (node.children) node.children.forEach(collapseAll); }
+    collapseAll(treeRoot);
+    // find hierarchy node in lastHierarchy to un-collapse ancestors
+    if (lastHierarchy) {
+      const h = lastHierarchy.descendants().find(n => n.data === selectedNode);
+      if (h) {
+        let p = h;
+        while (p) { p.data.collapsed = false; p = p.parent; }
+      } else {
+        selectedNode.collapsed = false;
+      }
+    } else {
+      selectedNode.collapsed = false;
+    }
+    renderTree(treeRoot);
+    hideContextMenu();
+  };
+
+  document.getElementById("expandAllDescendants").onclick = () => {
+    if (!selectedNode) { hideContextMenu(); return; }
+    function expandAll(node) { node.collapsed = false; if (node.children) node.children.forEach(expandAll); }
+    expandAll(selectedNode);
+    renderTree(treeRoot);
+    hideContextMenu();
+  };
+
+  document.getElementById("collapseAllDescendants").onclick = () => {
+    if (!selectedNode) { hideContextMenu(); return; }
+    function collapseAll(node) { node.collapsed = true; if (node.children) node.children.forEach(collapseAll); }
+    collapseAll(selectedNode);
+    renderTree(treeRoot);
+    hideContextMenu();
+  };
+
+  document.getElementById("cutNode").onclick = () => {
+    if (!selectedNode || selectedNode === treeRoot) { alert("Cannot cut root node."); hideContextMenu(); return; }
+    pasteBuffer = deepCopyNode(selectedNode);
+    removeNode(treeRoot, selectedNode);
+    renderTree(treeRoot);
+    hideContextMenu();
+  };
+
+  document.getElementById("pasteNode").onclick = () => {
+    if (!selectedNode) { hideContextMenu(); return; }
+    if (!pasteBuffer) { alert("Paste buffer is empty."); hideContextMenu(); return; }
+    selectedNode.children = selectedNode.children || [];
+    selectedNode.children.push(deepCopyNode(pasteBuffer));
+    selectedNode.collapsed = false;
+    renderTree(treeRoot);
+    pasteBuffer = null;
+    hideContextMenu();
+  };
+
+  document.getElementById("saveBranch").onclick = () => {
+    if (!selectedNode) { hideContextMenu(); return; }
+    try {
+      const opmlString = generateOPML(selectedNode);
+      const blob = new Blob([opmlString], { type: "text/xml" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${(selectedNode.name || 'branch').replace(/[\\/:*?"<>|]/g,'_')}.opml`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (err) {
+      console.error(err);
+      alert("Failed to save branch.");
+    }
+    hideContextMenu();
+  };
+
+  document.getElementById("importBranch").onclick = () => {
+    if (!selectedNode) { hideContextMenu(); return; }
+    const input = document.getElementById("importBranchFile");
+    input.onchange = e => {
+      const file = e.target.files[0];
+      if (!file) { input.value = ""; hideContextMenu(); return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const xml = new DOMParser().parseFromString(reader.result, "text/xml");
+          const parsed = parseOPML(xml);
+          // If parsed has multiple children, append them; if it's a single node, append it
+          if (parsed && Array.isArray(parsed.children) && parsed.children.length > 0) {
+            selectedNode.children = selectedNode.children || [];
+            selectedNode.children.push(...parsed.children.map(deepCopyNode));
+          } else {
+            selectedNode.children = selectedNode.children || [];
+            selectedNode.children.push(deepCopyNode(parsed));
+          }
+          selectedNode.collapsed = false;
+          renderTree(treeRoot);
+        } catch (err) {
+          console.error(err);
+          alert("Failed to import branch.");
+        }
+      };
+      reader.readAsText(file);
+      input.value = "";
+    };
+    input.click();
+    hideContextMenu();
+  };
+
+  // --- helper utilities ---
+  function getFormattedDateTime() {
+    const now = new Date();
+    const yy = String(now.getFullYear()).slice(-2);
+    const mm = String(now.getMonth()+1).padStart(2,'0');
+    const dd = String(now.getDate()).padStart(2,'0');
+    const hh = String(now.getHours()).padStart(2,'0');
+    const min = String(now.getMinutes()).padStart(2,'0');
+    return `${yy}${mm}${dd}-${hh}${min}`;
+  }
+
+  function hideContextMenu() {
+    document.getElementById("contextMenu").style.display = "none";
+    selectedNode = null;
+  }
+
+  function removeNode(parent, target) {
+    if (!parent.children) return false;
+    const idx = parent.children.indexOf(target);
+    if (idx !== -1) { parent.children.splice(idx,1); return true; }
+    for (const c of parent.children) { if (removeNode(c, target)) return true; }
+    return false;
+  }
+
+  function deepCopyNode(node) { return JSON.parse(JSON.stringify(node)); }
+  function generateOPML(rootNode) {
+    function buildOutline(node) {
+      const el = document.createElement("outline");
+      el.setAttribute("text", node.name || "Untitled");
+      if (node.collapsed) el.setAttribute("collapsed", "true");
+      if (node.children) node.children.forEach(child => el.appendChild(buildOutline(child)));
+      return el;
+    }
+    const opml = document.implementation.createDocument("", "", null);
+    const opmlEl = opml.createElement("opml");
+    opmlEl.setAttribute("version","2.0");
+    const head = opml.createElement("head");
+    const body = opml.createElement("body");
+    body.appendChild(buildOutline(rootNode));
+    opmlEl.appendChild(head); opmlEl.appendChild(body); opml.appendChild(opmlEl);
+    return new XMLSerializer().serializeToString(opml);
+  }
+
+  function parseOPML(xml) {
+    const parseNode = n => ({
+      name: n.getAttribute("text") || "Untitled",
+      collapsed: n.getAttribute("collapsed") === "true",
+      children: Array.from(n.children).map(parseNode)
+    });
+    const outlines = xml.querySelector("body")?.children || [];
+    return outlines.length === 1 ? parseNode(outlines[0]) : { name: "Root", collapsed: false, children: Array.from(outlines).map(parseNode) };
+  }
+
+  // --- renderTree + formatNode ---
+  function renderTree(data) {
+    g.selectAll("*").remove();
+    const root = d3.hierarchy(data, d => d.collapsed ? null : d.children);
+    lastHierarchy = root;
+    d3.tree().nodeSize([120, HORIZONTAL_PITCH])(root);
+
+    g.selectAll(".link").data(root.links()).join("path")
+      .attr("fill", "none")
+      .attr("stroke", "#555")
+      .attr("stroke-width", 3 * strokeWidth)
+      .attr("d", d3.linkHorizontal().x(d => d.y).y(d => d.x));
+
+    const nodes = g.selectAll(".node").data(root.descendants()).join("g")
+      .attr("class","node")
+      .attr("transform", d => `translate(${d.y},${d.x})`)
+      .on("click", (e,d) => { d.data.collapsed = !d.data.collapsed; renderTree(data); e.stopPropagation(); })
+      .on("contextmenu", (e,d) => { e.preventDefault(); selectedNode = d.data; showContextMenu(e); });
+
+    formatNode(nodes);
+  }
+
+  // Replace formatNode with the version you provided (plus HORIZONTAL_PITCH already used in layout)
+  function formatNode(nodes) {
+    const fontSize = 16;
+    const lineHeightEm = 1.1;
+    const paddingX = 20;
+    const paddingY = 10;
+    const targetAspect = 4;
+
+    // Hidden SVG for measurement
+    let measurer = d3.select("body").select("svg#measureText");
+    if (measurer.empty()) {
+      measurer = d3.select("body").append("svg")
+        .attr("id", "measureText")
+        .style("position", "absolute")
+        .style("visibility", "hidden")
+        .style("height", 0)
+        .style("width", 0);
+    }
+    const tmpText = measurer.selectAll("*").data([0]).join("text")
+      .style("font", `${fontSize}px sans-serif`);
+
+    function measureWidth(text) {
+      tmpText.text(text);
+      return tmpText.node().getComputedTextLength();
+    }
+
+    nodes.selectAll("rect").remove();
+    nodes.selectAll("text").remove();
+
+    nodes.append("rect")
+      .attr("rx", 20)
+      .attr("fill", d => (d.data && d.data.children) ? "darkred" : "darkblue")
+      .attr("stroke", "#333")
+      .attr("stroke-width", 2);
+
+    nodes.append("text")
+      .attr("text-anchor", "middle")
+      .style("fill", "white")
+      .style("font", `${fontSize}px sans-serif`)
+      .each(function(d) {
+        const textEl = d3.select(this);
+        textEl.text(null);
+
+        const label = (d.data && typeof d.data.name === 'string') ? d.data.name.trim() : "";
+        const words = label.length ? label.split(/\s+/) : [''];
+
+        const lineHeightPx = fontSize * lineHeightEm;
+
+        // Step 1: wrap text lines (greedy)
+        const maxLineWidth = 300; // maximum natural text width per line
+        const wrappedLines = [];
+        let currentLine = '';
+        words.forEach(word => {
+          const candidate = currentLine ? currentLine + ' ' + word : word;
+          const candidateWidth = measureWidth(candidate);
+          if (candidateWidth <= maxLineWidth) {
+            currentLine = candidate;
+          } else {
+            if (currentLine) wrappedLines.push(currentLine);
+            currentLine = word;
+          }
+        });
+        if (currentLine) wrappedLines.push(currentLine);
+
+        // Step 2: compute height and rectangle width
+        const textWidth = Math.max(...wrappedLines.map(measureWidth));
+        const height = wrappedLines.length * lineHeightPx + paddingY;
+        const width = Math.max(textWidth + paddingX, targetAspect * height);
+
+        // Step 3: append tspans
+        textEl.text(null);
+        wrappedLines.forEach((line, idx) => {
+          const dy = idx === 0 ? "0em" : `${lineHeightEm}em`;
+          const tspan = textEl.append("tspan").attr("x", 0).attr("dy", dy).text(line);
+          // Step 4: scale each line horizontally to fill rectangle width
+          const lineWidth = measureWidth(line);
+          const scaleX = lineWidth === 0 ? 1 : (width - paddingX) / lineWidth;
+          tspan.attr("transform", `scale(${scaleX},1)`);
+        });
+
+        // Step 5: assign rect size and center text
+        const node = d3.select(this.parentNode);
+        node.select("rect")
+          .attr("width", width)
+          .attr("height", height)
+          .attr("x", -width / 2)
+          .attr("y", -height / 2);
+
+        // vertically center text
+        const textY = -height / 2 + fontSize;
+        textEl.attr("x", 0).attr("y", textY);
+      });
+  }
+
+  function showContextMenu(e) {
+    const cm = document.getElementById("contextMenu");
+    cm.style.left = `${Math.min(e.clientX, window.innerWidth - 200)}px`;
+    cm.style.top = `${Math.min(e.clientY, window.innerHeight - 50)}px`;
+    cm.style.display = "block";
+  }
+
+  function goFullScreen() {
+    const el = document.documentElement;
+    if (el.requestFullscreen) el.requestFullscreen();
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else if (el.msRequestFullscreen) el.msRequestFullscreen();
+  }
+
+  function toggleDivElements(divId) {
+    const div = document.getElementById(divId);
+    if (!div) return;
+    const children = div.children;
+    if (children.length === 0) return;
+    const shouldHide = getComputedStyle(children[0]).display !== 'none';
+    for (let i = 0; i < children.length-1; i++) children[i].style.display = shouldHide ? 'none' : '';
+  }
+
+  // --- initialize with a small example tree ---
+  const sample = { name: "Root", collapsed: false, children: [
+    { name: "First child node", children: [{ name: "Deep child long wordssssss" }, { name: "Another child" }] },
+    { name: "Second child with a longer label potentially requiring several words" }
+  ]};
+  treeRoot = sample;
+  renderTree(treeRoot);
+
+} catch (err) {
+  alert('err: ' + err.message);
+} finally {
+  dbg('Main thread has finished running');
+}
+</script>
+</body>
+</html>
